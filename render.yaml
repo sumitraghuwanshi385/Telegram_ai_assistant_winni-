@@ -1,0 +1,10 @@
+{
+  "build": {
+    "commands": [
+      "pip install -r requirements.txt"
+    ]
+  },
+  "run": {
+    "command": "python telegram_ai_bot.py"
+  }
+}
