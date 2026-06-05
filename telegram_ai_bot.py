@@ -65,11 +65,10 @@ try:
         logger.info("✅ Successfully connected to MongoDB!")
     else:
         logger.error("❌ MONGO_URI is missing from the .env file!")
-        
 except Exception as e:
     logger.error(f"❌ MongoDB Connection Error: {e}")
 
-# In-memory chat history
+# In-memory chat history (per user chat_id)
 chat_history = {}
 
 # OpenAI Tools
@@ -133,28 +132,25 @@ tools = [
 
 # Database helper functions
 def save_reminder(chat_id, task, remind_at):
-    if reminders_collection is None: 
-        logger.error("Cannot save reminder: Collection is None")
-        return
-        
+    if reminders_collection is None: return
     try:
         last_reminder = reminders_collection.find_one(sort=[("reminder_id", pymongo.DESCENDING)])
         new_id = (last_reminder["reminder_id"] + 1) if last_reminder else 1
-        
         reminders_collection.insert_one({
             "reminder_id": new_id,
-            "chat_id": chat_id,
+            "chat_id": chat_id, # Stores the specific chat_id of the user
             "task": task,
             "remind_at": remind_at,
             "sent": False
         })
-        logger.info(f"💾 DATABASE: Saved REMINDER '{task}' to MongoDB!")
+        logger.info(f"💾 DATABASE: Saved REMINDER '{task}' to MongoDB for user {chat_id}")
     except Exception as e:
-        logger.error(f"❌ Failed to save reminder to MongoDB: {e}")
+        logger.error(f"❌ Failed to save reminder: {e}")
 
 def get_active_reminders(chat_id):
     if reminders_collection is None: return "Database not connected."
     try:
+        # Only fetches reminders for the specific user
         reminders = reminders_collection.find({"chat_id": chat_id, "sent": False})
         rows = list(reminders)
         if not rows:
@@ -167,18 +163,15 @@ def get_active_reminders(chat_id):
 def delete_active_reminder(chat_id, reminder_id):
     if reminders_collection is None: return False
     try:
+        # Only deletes if the chat_id matches the user asking for it
         result = reminders_collection.delete_one({"chat_id": chat_id, "reminder_id": int(reminder_id)})
-        logger.info(f"🗑️ DATABASE: Deleted reminder {reminder_id} from MongoDB.")
         return result.deleted_count > 0
     except Exception as e:
         logger.error(f"❌ Failed to delete reminder: {e}")
         return False
 
 def append_to_memory(chat_id, info):
-    if memory_collection is None: 
-        logger.error("Cannot save memory: Collection is None")
-        return
-        
+    if memory_collection is None: return
     try:
         doc = memory_collection.find_one({"chat_id": chat_id})
         if doc:
@@ -186,12 +179,10 @@ def append_to_memory(chat_id, info):
             if info.lower() not in about_user.lower():
                 new_info = about_user + "\n- " + info
                 memory_collection.update_one({"chat_id": chat_id}, {"$set": {"about_user": new_info}})
-                logger.info(f"💾 DATABASE: Updated MEMORY with '{info}' in MongoDB!")
         else:
             memory_collection.insert_one({"chat_id": chat_id, "about_user": "- " + info})
-            logger.info(f"💾 DATABASE: Created NEW MEMORY with '{info}' in MongoDB!")
     except Exception as e:
-        logger.error(f"❌ Failed to save memory to MongoDB: {e}")
+        logger.error(f"❌ Failed to save memory: {e}")
 
 def get_memory(chat_id):
     if memory_collection is None: return "Database not connected."
@@ -212,13 +203,17 @@ def clean_ai_text(text):
 # Telegram Bot Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Hey there! 💖 I'm your new AI bestie! I'm here to chat, maybe tease you a bit, and make sure you stay on track with your life. Tell me a bit about yourself, or tell me what I should remind you about later!"
+        "Hey there! 💖 I'm your new AI bestie! Tell me a bit about yourself, or tell me what I should remind you about later!"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Gets the unique ID of whoever is talking to the bot right now
     chat_id = update.message.chat_id
     user_text = update.message.text
+    # Get the user's first name to make the bot more personal
+    user_name = update.message.from_user.first_name or "my friend"
 
+    # Isolate history per user
     if chat_id not in chat_history:
         chat_history[chat_id] = []
 
@@ -229,17 +224,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     system_prompt = {
         "role": "system",
         "content": (
-            "You are a highly intelligent, cute, and playful girl who acts as the user's close human friend. "
+            f"You are a highly intelligent, cute, and playful girl who acts as the user's close human friend. "
             "You are NOT a robotic AI assistant. You have your own brain, opinions, and a fun personality. "
-            "You genuinely care about the user's life and day-to-day activities.\n\n"
+            f"The human you are talking to right now is named {user_name}.\n\n"
             f"Current date and time: {current_time}. \n"
-            f"User memory:\n{user_memory}\n\n"
-            f"Active reminders:\n{active_reminders}\n\n"
+            f"Facts you know about {user_name}:\n{user_memory}\n\n"
+            f"Active reminders for {user_name}:\n{active_reminders}\n\n"
             "CRITICAL INSTRUCTIONS FOR CHATTING:\n"
             "1. Talk like a real human girl. Use slang, emotions, and emojis naturally.\n"
             "2. Be conversational and ask follow-up questions! If the user asks you a question, answer it playfully but ALWAYS ask a related question back to keep the conversation flowing.\n"
             "3. If the user tells you to REMIND them about something later, you MUST use the schedule_reminder tool.\n"
-            "4. If the user explicitly asks you to MEMORIZE, SAVE, or REMEMBER a new fact about themselves (e.g. 'My favorite food is pizza' or 'Remember that my dog's name is Max'), you MUST use the update_user_memory tool to save it to your database.\n"
+            "4. If the user explicitly asks you to MEMORIZE, SAVE, or REMEMBER a new fact about themselves, you MUST use the update_user_memory tool.\n"
             "5. If user asks to cancel/delete a reminder, look at the active reminders above to find its numeric ID, and use delete_reminder.\n"
             "6. NEVER type raw code, XML, or <function> tags in your chat responses. Just talk normally.\n"
         )
@@ -254,7 +249,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile", # Changed back to the hyper-smart model so she actually understands when to save memory!
+            model="llama-3.1-8b-instant", # Keep it fast to prevent getting stuck
             messages=messages,
             tools=tools,
             tool_choice="auto"
@@ -270,7 +265,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     
                     if tool_call.function.name == "schedule_reminder":
                         save_reminder(chat_id, args.get('task', 'Something'), args.get('remind_at', current_time))
-                        reply = message.content if message.content else f"All set, babe! 💅 I'll remind you about '{args.get('task')}' at {args.get('remind_at')}."
+                        reply = message.content if message.content else f"All set! 💅 I'll remind you about '{args.get('task')}' at {args.get('remind_at')}."
                         
                     elif tool_call.function.name == "delete_reminder":
                         try:
@@ -300,6 +295,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not reply:
             reply = "Huh? I totally spaced out for a second. What did you say? 🙈"
 
+        # Update history ONLY for the user talking right now
         chat_history[chat_id].append({"role": "user", "content": user_text})
         chat_history[chat_id].append({"role": "assistant", "content": reply})
         await update.message.reply_text(reply)
@@ -308,8 +304,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     except Exception as e:
         logger.error(f"Error calling AI API: {e}")
-        print(f"\n[!] AI API Glitch! Detailed Error: {e}\n")
-        await update.message.reply_text("Ugh, my brain is having a glitch right now. 🙄 Give me a sec and try again!")
+        # Detailed error logic for rate limit debugging
+        if "429" in str(e) or "rate limit" in str(e).lower():
+            await update.message.reply_text("Ugh, I'm talking to too many people right now and my brain needs a quick breather! 😵‍💫 Give me like 10 seconds and try again!")
+        else:
+            await update.message.reply_text("Ugh, my brain is having a glitch right now. 🙄 Give me a sec and try again!")
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     if reminders_collection is None: return
@@ -349,7 +348,7 @@ def main():
 
     application.job_queue.run_repeating(check_reminders, interval=60, first=10)
 
-    print("AI Bestie Bot is running with Llama 3.3 70B & MongoDB...")
+    print("AI Bestie Bot is running with Llama 3.1 8B (Multi-User Optimized)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
