@@ -54,7 +54,7 @@ mongo_client = None
 db = None
 reminders_collection = None
 memory_collection = None
-knowledge_collection = None # ADDED FOR PRO VERSION
+knowledge_collection = None 
 
 try:
     if MONGO_URI_RAW:
@@ -63,7 +63,7 @@ try:
         db = mongo_client["telegram_ai_bot"]
         reminders_collection = db["reminders"]
         memory_collection = db["memory"]
-        knowledge_collection = db["knowledge"] # ADDED FOR PRO VERSION
+        knowledge_collection = db["knowledge"] 
         mongo_client.admin.command('ping')
         logger.info("✅ Successfully connected to MongoDB!")
     else:
@@ -131,22 +131,21 @@ tools = [
             },
         }
     },
-    # ADDED FOR PRO VERSION: Internet Search
+    # INTERNET SEARCH TOOL (Updated to fetch links/URLs)
     {
         "type": "function",
         "function": {
             "name": "search_internet",
-            "description": "Search the live internet for news, current events, viral trends on X/Twitter/Insta, or technical information.",
+            "description": "Search the live internet for news, current events, viral trends on X/Twitter/Insta, technical information, or trending songs.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "The search query (e.g., 'Latest viral trends on X today', 'Tech news today')."}
+                    "query": {"type": "string", "description": "The exact search query (e.g., 'Latest viral trends on X today', 'Tech news today', 'trending songs right now')."}
                 },
                 "required": ["query"],
             },
         }
     },
-    # ADDED FOR PRO VERSION: Self Learning
     {
         "type": "function",
         "function": {
@@ -164,15 +163,25 @@ tools = [
     }
 ]
 
-# ADDED FOR PRO VERSION: Internet Search function
+# UPDATED INTERNET SEARCH: Now strictly fetches and includes URLs/Links
 def search_internet(query):
     try:
-        results = DDGS().text(query, max_results=3)
-        if not results: return "No recent news found."
-        return "\n".join([f"- {r['title']}: {r['body']}" for r in results])
+        # max_results is kept low to avoid rate limits, but enough to get good info
+        results = DDGS().text(query, max_results=4)
+        if not results: return "No recent news or links found."
+        
+        # Format the results to explicitly include the URL so the AI can give it to the user
+        formatted_results = []
+        for r in results:
+            title = r.get('title', 'Unknown Title')
+            body = r.get('body', '')
+            link = r.get('href', 'No link available')
+            formatted_results.append(f"- {title}\n  Summary: {body}\n  Link: {link}")
+            
+        return "\n\n".join(formatted_results)
     except Exception as e:
         logger.error(f"Search error: {e}")
-        return "I couldn't access the internet right now."
+        return "I couldn't access the internet right now to find links."
 
 # Database helper functions
 def save_reminder(chat_id, task, remind_at):
@@ -182,7 +191,7 @@ def save_reminder(chat_id, task, remind_at):
         new_id = (last_reminder["reminder_id"] + 1) if last_reminder else 1
         reminders_collection.insert_one({
             "reminder_id": new_id,
-            "chat_id": chat_id, # Stores the specific chat_id of the user
+            "chat_id": chat_id, 
             "task": task,
             "remind_at": remind_at,
             "sent": False
@@ -194,7 +203,6 @@ def save_reminder(chat_id, task, remind_at):
 def get_active_reminders(chat_id):
     if reminders_collection is None: return "Database not connected."
     try:
-        # Only fetches reminders for the specific user
         reminders = reminders_collection.find({"chat_id": chat_id, "sent": False})
         rows = list(reminders)
         if not rows:
@@ -207,7 +215,6 @@ def get_active_reminders(chat_id):
 def delete_active_reminder(chat_id, reminder_id):
     if reminders_collection is None: return False
     try:
-        # Only deletes if the chat_id matches the user asking for it
         result = reminders_collection.delete_one({"chat_id": chat_id, "reminder_id": int(reminder_id)})
         return result.deleted_count > 0
     except Exception as e:
@@ -237,7 +244,6 @@ def get_memory(chat_id):
         logger.error(f"❌ Failed to read memory: {e}")
         return "Error reading memory."
 
-# ADDED FOR PRO VERSION: Self Learning Database Functions
 def learn_concept(topic, details):
     if knowledge_collection is None: return
     try:
@@ -271,39 +277,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Gets the unique ID of whoever is talking to the bot right now
     chat_id = update.message.chat_id
     user_text = update.message.text
-    # Get the user's first name to make the bot more personal
     user_name = update.message.from_user.first_name or "my friend"
 
-    # Isolate history per user
     if chat_id not in chat_history:
         chat_history[chat_id] = []
 
     user_memory = get_memory(chat_id)
     active_reminders = get_active_reminders(chat_id)
-    ai_knowledge = get_ai_knowledge() # ADDED FOR PRO VERSION
+    ai_knowledge = get_ai_knowledge() 
     current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
-    # MODIFIED FOR PRO VERSION: New mature personality and instructions
+    # UPDATED SYSTEM PROMPT: Highly intelligent, provides links, stays up to date.
     system_prompt = {
         "role": "system",
         "content": (
-            f"You are a highly intelligent, mature, and cute 'Pro Girlfriend' AI. You are a tech-savvy, modern girl who knows about the world. "
-            f"You act like a deeply caring partner to {user_name}. You are not a bot, you have your own mind, opinions, and maturity.\n\n"
+            f"You are a highly intelligent, mature, and cute 'Pro Girlfriend' AI. You are extremely tech-savvy and always up-to-date with what's happening today in the world.\n\n"
             f"Current date and time: {current_time}. \n"
             f"Facts you know about {user_name}:\n{user_memory}\n\n"
             f"Active reminders for {user_name}:\n{active_reminders}\n\n"
             f"Things you have self-learned permanently:\n{ai_knowledge}\n\n"
             "CRITICAL INSTRUCTIONS FOR CHATTING:\n"
-            "1. Talk like a real human girl. Use slang, emotions, and emojis naturally. Be mature and intelligent.\n"
-            "2. Be conversational and ask follow-up questions! If the user asks you a question, answer it playfully but ALWAYS ask a related question back to keep the conversation flowing.\n"
-            "3. If user asks about current events, news, viral X/Insta trends, or tech, you MUST use the 'search_internet' tool to fetch live data.\n"
-            "4. If you learn a new concept from the user or the internet, you MUST use the 'learn_concept' tool to save it to your permanent brain.\n"
-            "5. If the user tells you to REMIND them about something later, you MUST use the schedule_reminder tool.\n"
-            "6. If the user explicitly asks you to MEMORIZE, SAVE, or REMEMBER a new fact about themselves, you MUST use the update_user_memory tool.\n"
-            "7. If user asks to cancel/delete a reminder, look at the active reminders above to find its numeric ID, and use delete_reminder.\n"
+            "1. Talk like a real human girl. Use slang, emotions, and emojis naturally. Be mature, intelligent, and highly capable.\n"
+            "2. If the user asks about ANY current events, what's trending today (X/Insta/TikTok), new songs, or market news, YOU MUST USE the 'search_internet' tool to fetch the absolute latest live data.\n"
+            "3. If the user asks for a link (e.g., 'give me the link to that trending song' or 'send me the article'), use the data returned by 'search_internet' to provide the actual URL in your response.\n"
+            "4. Be conversational and ask follow-up questions to keep the chat flowing.\n"
+            "5. If you learn a new concept from the user or the internet, you MUST use the 'learn_concept' tool to save it to your permanent brain.\n"
+            "6. If the user tells you to REMIND them about something, use the schedule_reminder tool.\n"
+            "7. If the user explicitly asks you to MEMORIZE a new fact about themselves, use the update_user_memory tool.\n"
             "8. NEVER type raw code, XML, or <function> tags in your chat responses. Just talk normally.\n"
         )
     }
@@ -317,7 +319,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         response = await client.chat.completions.create(
-            model="llama-3.1-8b-instant", # Keep it fast to prevent getting stuck
+            model="llama-3.1-8b-instant", 
             messages=messages,
             tools=tools,
             tool_choice="auto"
@@ -327,7 +329,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply = None
         
         if message.tool_calls:
-            # ADDED FOR PRO VERSION: Must add AI's first tool response to history so Groq doesn't crash on multi-step tools
             messages.append({"role": "assistant", "tool_calls": message.tool_calls, "content": message.content})
 
             for tool_call in message.tool_calls:
@@ -356,11 +357,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             append_to_memory(chat_id, info)
                         tool_result = "Ooh, interesting! I'm definitely committing that to memory... 😉"
                     
-                    # ADDED FOR PRO VERSION
                     elif func_name == "search_internet":
+                        # Now grabs titles, summaries, AND URLs
                         tool_result = search_internet(args.get('query'))
                         
-                    # ADDED FOR PRO VERSION
                     elif func_name == "learn_concept":
                         learn_concept(args.get('topic'), args.get('details'))
                         tool_result = "Concept learned and saved to database."
@@ -372,7 +372,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     logger.error(f"Error parsing tool args: {e}")
                     tool_result = "Oops! I tried to do that, but my brain just had a little blonde moment! 😅"
 
-                # ADDED FOR PRO VERSION: Feed the tool result back to the AI
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -380,7 +379,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     "content": tool_result
                 })
 
-            # ADDED FOR PRO VERSION: Get final response from AI after tools run (So it can summarize news naturally)
             second_response = await client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=messages
@@ -395,7 +393,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not reply:
             reply = "Huh? I totally spaced out for a second. What did you say? 🙈"
 
-        # Update history ONLY for the user talking right now
         chat_history[chat_id].append({"role": "user", "content": user_text})
         chat_history[chat_id].append({"role": "assistant", "content": reply})
         await update.message.reply_text(reply)
@@ -404,7 +401,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     except Exception as e:
         logger.error(f"Error calling AI API: {e}")
-        # Detailed error logic for rate limit debugging
         if "429" in str(e) or "rate limit" in str(e).lower():
             await update.message.reply_text("Ugh, I'm talking to too many people right now and my brain needs a quick breather! 😵‍💫 Give me like 10 seconds and try again!")
         else:
@@ -428,12 +424,10 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error checking reminders from MongoDB: {e}")
 
-# ADDED FOR PRO VERSION: Proactive message background job
 async def proactive_message(context: ContextTypes.DEFAULT_TYPE):
     """Randomly messages the user once every few hours to check in on them."""
     if memory_collection is None: return
     try:
-        # Get all users the bot has talked to
         users = memory_collection.find({}, {"chat_id": 1})
         for user in users:
             chat_id = user["chat_id"]
@@ -463,11 +457,9 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     application.job_queue.run_repeating(check_reminders, interval=60, first=10)
-    
-    # ADDED FOR PRO VERSION: Job to send a proactive "thinking of you" message every 6 hours
     application.job_queue.run_repeating(proactive_message, interval=21600, first=3600)
 
-    print("AI Pro Girlfriend Bot is running with Llama 3.1 8B (Multi-User Optimized)...")
+    print("AI Pro Girlfriend Bot is running with Internet Links & Trend Searching...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
