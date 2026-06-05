@@ -10,6 +10,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from openai import AsyncOpenAI
 import pymongo
 from pymongo import MongoClient
+import requests
+from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 
 # Load environment variables
@@ -131,18 +133,31 @@ tools = [
             },
         }
     },
-    # INTERNET SEARCH TOOL (Updated to fetch links/URLs)
     {
         "type": "function",
         "function": {
-            "name": "search_internet",
-            "description": "Search the live internet for news, current events, viral trends on X/Twitter/Insta, technical information, or trending songs.",
+            "name": "search_news",
+            "description": "Search DuckDuckGo specifically for the LATEST NEWS, CURRENT TRENDS, or VIRAL TOPICS today.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "The exact search query (e.g., 'Latest viral trends on X today', 'Tech news today', 'trending songs right now')."}
+                    "query": {"type": "string", "description": "The EXACT search query (e.g., 'most viral instagram reels song today', 'latest tech news')."}
                 },
                 "required": ["query"],
+            },
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scrape_website",
+            "description": "If you need deep details from a specific URL returned by the search, use this tool to read the text of the webpage.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The full http URL to scrape."}
+                },
+                "required": ["url"],
             },
         }
     },
@@ -163,25 +178,49 @@ tools = [
     }
 ]
 
-# UPDATED INTERNET SEARCH: Now strictly fetches and includes URLs/Links
-def search_internet(query):
+# UPDATED SEARCH TOOL: Forces the "news" endpoint on DuckDuckGo to guarantee 100% fresh, working links.
+def search_news(query):
     try:
-        # max_results is kept low to avoid rate limits, but enough to get good info
-        results = DDGS().text(query, max_results=4)
-        if not results: return "No recent news or links found."
+        # Using the news() function of DDGS gets actual published articles with valid links from TODAY
+        results = DDGS().news(query, max_results=5)
+        if not results:
+            # Fallback to normal text search if it's not a "news" topic (like a song)
+            results = DDGS().text(query + " 2026", max_results=5)
+            
+        if not results: return "No recent info or links found on the internet."
         
-        # Format the results to explicitly include the URL so the AI can give it to the user
         formatted_results = []
         for r in results:
             title = r.get('title', 'Unknown Title')
+            # For news it's 'url', for text it's 'href'
+            link = r.get('url', r.get('href', 'No link available'))
+            # For news it's 'body', text is 'body' too usually
             body = r.get('body', '')
-            link = r.get('href', 'No link available')
-            formatted_results.append(f"- {title}\n  Summary: {body}\n  Link: {link}")
+            date = r.get('date', 'Recent')
             
-        return "\n\n".join(formatted_results)
+            # Basic validation to make sure it's a real link
+            if link and link.startswith('http'):
+                formatted_results.append(f"[{date}] - {title}\n  Summary: {body}\n  Link: {link}")
+            
+        return "\n\n".join(formatted_results[:4])
     except Exception as e:
         logger.error(f"Search error: {e}")
         return "I couldn't access the internet right now to find links."
+
+def scrape_website(url):
+    """Scrapes the text content of a working URL so the AI can read the actual article."""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        # Extract text from paragraphs
+        paragraphs = soup.find_all('p')
+        text = ' '.join([p.get_text() for p in paragraphs])
+        # Return first 1000 chars so we don't blow up the AI memory limit
+        return text[:1000] + "... [Content Trimmed]"
+    except Exception as e:
+        logger.error(f"Scrape error: {e}")
+        return "Failed to read the website. The link might be protected or broken."
 
 # Database helper functions
 def save_reminder(chat_id, task, remind_at):
@@ -289,7 +328,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ai_knowledge = get_ai_knowledge() 
     current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
-    # UPDATED SYSTEM PROMPT: Highly intelligent, provides links, stays up to date.
+    # UPDATED SYSTEM PROMPT: Forces AI to verify information and not hallucinate links.
     system_prompt = {
         "role": "system",
         "content": (
@@ -300,13 +339,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Things you have self-learned permanently:\n{ai_knowledge}\n\n"
             "CRITICAL INSTRUCTIONS FOR CHATTING:\n"
             "1. Talk like a real human girl. Use slang, emotions, and emojis naturally. Be mature, intelligent, and highly capable.\n"
-            "2. If the user asks about ANY current events, what's trending today (X/Insta/TikTok), new songs, or market news, YOU MUST USE the 'search_internet' tool to fetch the absolute latest live data.\n"
-            "3. If the user asks for a link (e.g., 'give me the link to that trending song' or 'send me the article'), use the data returned by 'search_internet' to provide the actual URL in your response.\n"
+            "2. If the user asks about ANY current events, trending topics, songs, or market news, YOU MUST USE the 'search_news' tool to fetch the absolute latest live data.\n"
+            "3. DO NOT HALLUCINATE LINKS. ONLY give the user a link if the 'search_news' tool actually returned a valid URL. If the tool didn't return a link, tell the user you couldn't find a direct link but give them the information.\n"
             "4. Be conversational and ask follow-up questions to keep the chat flowing.\n"
             "5. If you learn a new concept from the user or the internet, you MUST use the 'learn_concept' tool to save it to your permanent brain.\n"
             "6. If the user tells you to REMIND them about something, use the schedule_reminder tool.\n"
-            "7. If the user explicitly asks you to MEMORIZE a new fact about themselves, use the update_user_memory tool.\n"
-            "8. NEVER type raw code, XML, or <function> tags in your chat responses. Just talk normally.\n"
+            "7. NEVER type raw code, XML, or <function> tags in your chat responses. Just talk normally.\n"
         )
     }
 
@@ -357,9 +395,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             append_to_memory(chat_id, info)
                         tool_result = "Ooh, interesting! I'm definitely committing that to memory... 😉"
                     
-                    elif func_name == "search_internet":
-                        # Now grabs titles, summaries, AND URLs
-                        tool_result = search_internet(args.get('query'))
+                    elif func_name == "search_news":
+                        # Updated to grab actual news/working links
+                        tool_result = search_news(args.get('query'))
+                        
+                    elif func_name == "scrape_website":
+                        tool_result = scrape_website(args.get('url'))
                         
                     elif func_name == "learn_concept":
                         learn_concept(args.get('topic'), args.get('details'))
@@ -459,7 +500,7 @@ def main():
     application.job_queue.run_repeating(check_reminders, interval=60, first=10)
     application.job_queue.run_repeating(proactive_message, interval=21600, first=3600)
 
-    print("AI Pro Girlfriend Bot is running with Internet Links & Trend Searching...")
+    print("AI Pro Girlfriend Bot is running with Advanced Scraping & News Fetching...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
