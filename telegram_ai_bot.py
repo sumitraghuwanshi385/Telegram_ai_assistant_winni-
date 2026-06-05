@@ -19,7 +19,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MONGO_URI_RAW = os.getenv("MONGO_URI")
 
-# Initialize OpenAI client pointing to Groq
+# Initialize OpenAI client
 client = AsyncOpenAI(
     api_key=GROQ_API_KEY,
     base_url="https://api.groq.com/openai/v1",
@@ -54,7 +54,7 @@ try:
         db = mongo_client["telegram_ai_bot"]
         reminders_collection = db["reminders"]
         memory_collection = db["memory"]
-        knowledge_collection = db["knowledge"] # New collection for self-learning
+        knowledge_collection = db["knowledge"] 
         mongo_client.admin.command('ping')
         logger.info("✅ Successfully connected to MongoDB!")
 except Exception as e:
@@ -125,18 +125,15 @@ tools = [
     }
 ]
 
-# Internet Search Helper
 def search_internet(query):
     try:
         results = DDGS().text(query, max_results=3)
-        if not results:
-            return "No recent news found on this."
+        if not results: return "No recent news found."
         return "\n".join([f"- {r['title']}: {r['body']}" for r in results])
     except Exception as e:
         logger.error(f"Search error: {e}")
         return "I couldn't access the internet right now."
 
-# Database helper functions
 def save_reminder(chat_id, task, remind_at):
     if reminders_collection is None: return
     try:
@@ -170,7 +167,6 @@ def get_memory(chat_id):
         return doc["about_user"] if doc else "None"
     except: return "None"
 
-# Self-Learning Logic
 def learn_concept(topic, details):
     if knowledge_collection is None: return
     try:
@@ -179,14 +175,11 @@ def learn_concept(topic, details):
             knowledge_collection.update_one({"topic": topic.lower()}, {"$set": {"details": doc.get("details", "") + "\n" + details}})
         else:
             knowledge_collection.insert_one({"topic": topic.lower(), "details": details})
-        logger.info(f"🧠 AI Self-Learned: {topic}")
     except Exception as e: logger.error(f"❌ Failed to learn concept: {e}")
 
 def get_ai_knowledge():
-    """Retrieves 3 random things the AI has learned to make it sound smart."""
     if knowledge_collection is None: return "None"
     try:
-        # Get 3 random learned concepts using MongoDB aggregation
         pipeline = [{"$sample": {"size": 3}}]
         docs = list(knowledge_collection.aggregate(pipeline))
         if not docs: return "I am ready to learn new things!"
@@ -199,7 +192,6 @@ def clean_ai_text(text):
     text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.IGNORECASE|re.DOTALL)
     return text.strip()
 
-# Telegram Bot Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Hey! ✨ I'm your AI girl. I'm smart, I keep up with the world, and I actually care about you. Tell me about your day, or let's talk about something deep!"
@@ -241,9 +233,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     messages = [system_prompt] + clean_history + [{"role": "user", "content": user_text}]
 
     try:
-        # Use Llama 3 70B (High Intelligence required for complex tools & deep conversation)
+        # Changed back to 8B model to prevent the Token/Rate Limit crash when calling tools!
         response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=messages,
             tools=tools,
             tool_choice="auto"
@@ -253,32 +245,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply = None
         
         if message.tool_calls:
-            messages.append(message) # Add AI's tool call to context
+            # Add AI's tool call to context so it doesn't crash on the second pass
+            messages.append({"role": "assistant", "tool_calls": message.tool_calls, "content": message.content})
             
             for tool_call in message.tool_calls:
-                args = json.loads(tool_call.function.arguments)
-                func_name = tool_call.function.name
-                
-                if func_name == "schedule_reminder":
-                    save_reminder(chat_id, args.get('task'), args.get('remind_at'))
-                    tool_result = "Reminder saved."
+                try:
+                    args = json.loads(tool_call.function.arguments)
+                    func_name = tool_call.function.name
                     
-                elif func_name == "update_user_memory":
-                    append_to_memory(chat_id, args.get('info'))
-                    tool_result = "Memory saved."
-                    
-                elif func_name == "search_internet":
-                    # Perform live web search
-                    tool_result = search_internet(args.get('query'))
-                    
-                elif func_name == "learn_concept":
-                    learn_concept(args.get('topic'), args.get('details'))
-                    tool_result = "Concept learned and saved to database."
-                
-                else:
-                    tool_result = "Unknown tool."
+                    if func_name == "schedule_reminder":
+                        save_reminder(chat_id, args.get('task'), args.get('remind_at'))
+                        tool_result = "Reminder saved successfully."
+                        
+                    elif func_name == "update_user_memory":
+                        append_to_memory(chat_id, args.get('info'))
+                        tool_result = "Memory saved successfully."
+                        
+                    elif func_name == "search_internet":
+                        tool_result = search_internet(args.get('query'))
+                        
+                    elif func_name == "learn_concept":
+                        learn_concept(args.get('topic'), args.get('details'))
+                        tool_result = "Concept learned and saved to database."
+                    else:
+                        tool_result = "Unknown tool."
+                except Exception as e:
+                    logger.error(f"Error parsing tool: {e}")
+                    tool_result = "Failed to run tool."
 
-                # Feed the tool result back to the AI so it can formulate a final answer
+                # Feed the tool result back
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -288,7 +283,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             # Get final response from AI after tools run
             second_response = await client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 messages=messages
             )
             reply = second_response.choices[0].message.content
@@ -305,10 +300,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         chat_history[chat_id].append({"role": "assistant", "content": reply})
         await update.message.reply_text(reply)
 
-        chat_history[chat_id] = chat_history[chat_id][-6:] 
+        chat_history[chat_id] = chat_history[chat_id][-4:] 
 
     except Exception as e:
         logger.error(f"Error calling AI API: {e}")
+        # Make the error message cute but helpful
         await update.message.reply_text("My mind is racing right now... give me a quick second to catch my breath! ❤️‍🔥")
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
@@ -325,16 +321,12 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error checking reminders: {e}")
 
-# Proactive Message Job (Self-Messaging)
 async def proactive_message(context: ContextTypes.DEFAULT_TYPE):
-    """Randomly messages the user once every few hours to check in on them."""
     if memory_collection is None: return
     try:
-        # Get all users the bot has talked to
         users = memory_collection.find({}, {"chat_id": 1})
         for user in users:
             chat_id = user["chat_id"]
-            # To keep it simple, we just send a cute text. In a massive production app, you'd track last message time.
             msg = "Hey... I was just thinking about you. How is your day going? ❤️"
             try:
                 await context.bot.send_message(chat_id=chat_id, text=msg)
@@ -354,13 +346,10 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Job to check reminders every 60 seconds
     application.job_queue.run_repeating(check_reminders, interval=60, first=10)
-    
-    # Job to send a proactive "thinking of you" message every 6 hours (21600 seconds)
     application.job_queue.run_repeating(proactive_message, interval=21600, first=3600)
 
-    print("AI Pro Girlfriend Bot is running with Live Internet & Self-Learning...")
+    print("AI Pro Girlfriend Bot is running perfectly!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
