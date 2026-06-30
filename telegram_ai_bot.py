@@ -443,7 +443,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Hey! ✨ I'm your AI girl. I'm smart, I keep up with the world in real time, "
         "and I actually care about you. Tell me about your day, or let's talk about something deep!"
     )
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
     user_text = update.message.text
@@ -462,7 +461,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     current_time = now.strftime("%Y-%m-%dT%H:%M:%S")
     current_time_readable = now.strftime("%A, %d %B %Y, %I:%M %p")
 
-   system_prompt = {
+    system_prompt = {
         "role": "system",
         "content": (
             "You are a highly intelligent, witty, mature 'Pro Girlfriend' AI. You talk like a real "
@@ -512,11 +511,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
+                parallel_tool_calls=False,
                 temperature=0.8,
                 max_tokens=600,
-            )
+                )
+        except BadRequestError as first_err:
+            err_code = getattr(getattr(first_err, "body", {}), "get", lambda *_: None)("code") \
+                if isinstance(getattr(first_err, "body", None), dict) else None
+            is_tool_use_failed = "tool_use_failed" in str(first_err)
+
+            if is_tool_use_failed:
+                logger.warning(f"Groq tool_use_failed (malformed function call) — falling back to tool-less reply: {first_err}")
+                fallback_messages = messages + [{
+                    "role": "system",
+                    "content": (
+                        "Your previous attempt to call a search tool was malformed and rejected by the API. "
+                        "Do NOT attempt another tool call. Reply directly in plain conversational text. "
+                        "If the user's question needed live/current info, be honest that you're not able to "
+                        "fetch it right now instead of guessing."
+                    )
+                }]
+                response = await client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=fallback_messages,
+                    temperature=0.7,
+                    max_tokens=400,
+                )
+            else:
+                logger.warning(f"First completion attempt failed, retrying once: {first_err}")
+                await asyncio.sleep(1.5)
+                response = await client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    parallel_tool_calls=False,
+                    temperature=0.8,
+                    max_tokens=600,
+                )
         except Exception as first_err:
-            # Transient network/5xx hiccups: one quick retry before giving up.
             logger.warning(f"First completion attempt failed, retrying once: {first_err}")
             await asyncio.sleep(1.5)
             response = await client.chat.completions.create(
@@ -524,6 +557,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
+                parallel_tool_calls=False,
                 temperature=0.8,
                 max_tokens=600,
             )
@@ -532,11 +566,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply = None
 
         if message.tool_calls:
-            # FIX: tool_calls must be serialized as plain dicts, not SDK objects,
-            # or the follow-up request can silently misbehave.
-            # FIX #2: Groq's API rejects an assistant message that has
-            # tool_calls AND content="" — content must be None in that case.
-            # This was the actual cause of the "brain glitch" fallback message.
             serialized_tool_calls = [
                 {
                     "id": tc.id,
@@ -639,12 +668,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         chat_history[chat_id].append({"role": "assistant", "content": reply})
         await update.message.reply_text(reply)
 
-        # Keep last N turns (user+assistant pairs)
         chat_history[chat_id] = chat_history[chat_id][-(HISTORY_TURNS_TO_KEEP * 2):]
 
     except Exception as e:
         logger.error(f"Error calling AI API: {e}")
-        logger.error(traceback.format_exc())  # full traceback -> check your terminal/logs to see the EXACT cause
+        logger.error(traceback.format_exc())
         if "429" in str(e) or "rate limit" in str(e).lower():
             await update.message.reply_text(
                 "Ugh, I'm talking to too many people right now and my brain needs a quick breather! 😵‍💫 "
