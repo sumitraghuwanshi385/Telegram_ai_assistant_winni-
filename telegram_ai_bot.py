@@ -462,7 +462,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     current_time = now.strftime("%Y-%m-%dT%H:%M:%S")
     current_time_readable = now.strftime("%A, %d %B %Y, %I:%M %p")
 
-    system_prompt = {
+   system_prompt = {
         "role": "system",
         "content": (
             "You are a highly intelligent, witty, mature 'Pro Girlfriend' AI. You talk like a real "
@@ -490,7 +490,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "5. If the user wants to know their reminders, use list_reminders. To delete one, use its ID "
             "(call list_reminders first if you're not sure of the ID).\n"
             "6. When you learn something new and useful (from the user or the internet), use learn_concept.\n"
-            "7. NEVER output raw code, XML, JSON, or <function> tags in your chat reply — only natural talk.\n"
+            "7. Output clean conversational text to the user. Do not leak raw JSON payloads or code blocks meant for tools in your final conversational response.\n"
             "8. Keep replies conversational length (not essays) unless the user asks for detail, and ask "
             "a natural follow-up sometimes to keep the conversation alive — but don't force a question "
             "into every single message.\n"
