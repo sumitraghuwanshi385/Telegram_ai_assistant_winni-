@@ -9,7 +9,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 import pymongo
 from pymongo import MongoClient
 import requests
@@ -155,15 +155,18 @@ tools = [
             },
         }
     },
-    {
+   {
         "type": "function",
         "function": {
             "name": "search_news",
-            "description": "Search the web for TODAY's news, current events, trending topics, prices, scores, or any fact that can change over time. ALWAYS use this instead of answering from memory when the user asks about anything time-sensitive.",
+            "description": "Search the web for current events, fresh news, trending topics, sports scores, or real-time updates.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "A focused search query, e.g. 'India vs Australia score today', 'iPhone 18 launch date', 'top trending reel today'."}
+                    "query": {
+                        "type": "string", 
+                        "description": "The search keywords, e.g., 'India breaking news' or 'tech trends'."
+                    }
                 },
                 "required": ["query"],
             },
