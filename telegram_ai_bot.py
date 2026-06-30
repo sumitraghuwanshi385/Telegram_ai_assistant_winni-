@@ -2,6 +2,8 @@ import os
 import json
 import logging
 import re
+import traceback
+import asyncio
 import urllib.parse
 from datetime import datetime
 from dotenv import load_dotenv
@@ -74,6 +76,7 @@ db = None
 reminders_collection = None
 memory_collection = None
 knowledge_collection = None
+style_collection = None
 
 try:
     if MONGO_URI_RAW:
@@ -83,6 +86,7 @@ try:
         reminders_collection = db["reminders"]
         memory_collection = db["memory"]
         knowledge_collection = db["knowledge"]
+        style_collection = db["communication_style"]
         mongo_client.admin.command('ping')
         logger.info("✅ Successfully connected to MongoDB!")
     else:
@@ -348,6 +352,81 @@ def get_ai_knowledge():
     except Exception:
         return "None"
 
+# ----------------------------------------------------------------------------
+# Self-learning communication style
+# ----------------------------------------------------------------------------
+def update_style_profile(chat_id, user_text):
+    """
+    Cheaply derives lightweight signals from the user's raw message (no extra
+    LLM call needed) and accumulates them in MongoDB so the bot can adapt its
+    tone/length/language-mix over time instead of staying static.
+    """
+    if style_collection is None:
+        return
+    try:
+        has_hindi = bool(re.search(r'[\u0900-\u097F]', user_text))  # Devanagari script
+        is_hinglish_latin = bool(re.search(
+            r'\b(hai|nahi|kya|kyu|tum|tumhe|mujhe|kar|raha|rhi|rha|acha|theek|haan|ky)\b',
+            user_text, re.IGNORECASE
+        ))
+        msg_len = len(user_text.split())
+        uses_emoji = bool(re.search(r'[\U0001F300-\U0001FAFF\u2764\uFE0F]', user_text))
+
+        style_collection.update_one(
+            {"chat_id": chat_id},
+            {
+                "$inc": {
+                    "total_messages": 1,
+                    "hindi_script_count": 1 if has_hindi else 0,
+                    "hinglish_count": 1 if is_hinglish_latin else 0,
+                    "emoji_count": 1 if uses_emoji else 0,
+                    "total_words": msg_len,
+                },
+            },
+            upsert=True
+        )
+    except Exception as e:
+        logger.error(f"❌ Failed to update style profile: {e}")
+
+def get_style_summary(chat_id):
+    """Turns the accumulated counters into a short human-readable instruction
+    that gets injected into the system prompt, so the bot's tone genuinely
+    adapts to how this specific user talks."""
+    if style_collection is None:
+        return "No style data yet — default to natural Hinglish, medium-length replies."
+    try:
+        doc = style_collection.find_one({"chat_id": chat_id})
+        if not doc or doc.get("total_messages", 0) < 3:
+            return "Not enough data yet — default to natural Hinglish, medium-length replies."
+
+        total = doc["total_messages"]
+        hindi_ratio = doc.get("hindi_script_count", 0) / total
+        hinglish_ratio = doc.get("hinglish_count", 0) / total
+        emoji_ratio = doc.get("emoji_count", 0) / total
+        avg_words = doc.get("total_words", 0) / total
+
+        lang_note = (
+            "User mostly types in Devanagari Hindi script — mirror that sometimes."
+            if hindi_ratio > 0.5 else
+            "User mostly types Hinglish in Roman/English letters — keep replying in Hinglish/English, not Devanagari."
+            if hinglish_ratio > 0.3 else
+            "User mostly types in English — keep replies mostly English with light Hinglish flavor only."
+        )
+        length_note = (
+            "User sends short messages — keep your replies short and punchy too."
+            if avg_words < 6 else
+            "User sends longer, detailed messages — you can match with slightly fuller replies."
+        )
+        emoji_note = (
+            "User uses emojis often — feel free to use a couple naturally."
+            if emoji_ratio > 0.3 else
+            "User rarely uses emojis — keep emoji use minimal, don't overdo it."
+        )
+        return f"{lang_note} {length_note} {emoji_note}"
+    except Exception as e:
+        logger.error(f"❌ Failed to read style profile: {e}")
+        return "Default to natural Hinglish, medium-length replies."
+
 def clean_ai_text(text):
     if not text:
         return text
@@ -373,9 +452,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if chat_id not in chat_history:
         chat_history[chat_id] = []
 
+    update_style_profile(chat_id, user_text)
+
     user_memory = get_memory(chat_id)
     active_reminders = get_active_reminders(chat_id)
     ai_knowledge = get_ai_knowledge()
+    style_summary = get_style_summary(chat_id)
     now = datetime.now()
     current_time = now.strftime("%Y-%m-%dT%H:%M:%S")
     current_time_readable = now.strftime("%A, %d %B %Y, %I:%M %p")
@@ -392,6 +474,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Facts you know about {user_name}:\n{user_memory}\n\n"
             f"{user_name}'s active reminders:\n{active_reminders}\n\n"
             f"Things you've self-learned permanently:\n{ai_knowledge}\n\n"
+            f"How {user_name} communicates (learned from past messages, adapt to this): {style_summary}\n\n"
             "HARD RULES:\n"
             "1. Your own training data is OLD. For ANY question about current events, news, scores, "
             "prices, releases, trends, 'who is', 'what happened', or anything that can change over "
@@ -423,13 +506,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     messages = [system_prompt] + clean_hist + [{"role": "user", "content": user_text}]
 
     try:
-        response = await client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            temperature=0.8,
-        )
+        try:
+            response = await client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.8,
+                max_tokens=600,
+            )
+        except Exception as first_err:
+            # Transient network/5xx hiccups: one quick retry before giving up.
+            logger.warning(f"First completion attempt failed, retrying once: {first_err}")
+            await asyncio.sleep(1.5)
+            response = await client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.8,
+                max_tokens=600,
+            )
 
         message = response.choices[0].message
         reply = None
@@ -437,6 +534,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if message.tool_calls:
             # FIX: tool_calls must be serialized as plain dicts, not SDK objects,
             # or the follow-up request can silently misbehave.
+            # FIX #2: Groq's API rejects an assistant message that has
+            # tool_calls AND content="" — content must be None in that case.
+            # This was the actual cause of the "brain glitch" fallback message.
             serialized_tool_calls = [
                 {
                     "id": tc.id,
@@ -450,7 +550,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ]
             messages.append({
                 "role": "assistant",
-                "content": message.content or "",
+                "content": message.content if message.content else None,
                 "tool_calls": serialized_tool_calls,
             })
 
@@ -509,11 +609,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     "content": str(tool_result),
                 })
 
-            second_response = await client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=0.8,
-            )
+            try:
+                second_response = await client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=0.8,
+                    max_tokens=600,
+                )
+            except Exception as second_err:
+                logger.warning(f"Second completion attempt failed, retrying once: {second_err}")
+                await asyncio.sleep(1.5)
+                second_response = await client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=0.8,
+                    max_tokens=600,
+                )
             reply = second_response.choices[0].message.content
 
         if not reply:
@@ -533,6 +644,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     except Exception as e:
         logger.error(f"Error calling AI API: {e}")
+        logger.error(traceback.format_exc())  # full traceback -> check your terminal/logs to see the EXACT cause
         if "429" in str(e) or "rate limit" in str(e).lower():
             await update.message.reply_text(
                 "Ugh, I'm talking to too many people right now and my brain needs a quick breather! 😵‍💫 "
